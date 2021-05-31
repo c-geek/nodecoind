@@ -1,8 +1,52 @@
 # ------------------------------------------------------------------------------
-# Build Stage
+# Build builder-image stage
 # ------------------------------------------------------------------------------
 
-FROM node:10-alpine as build
+FROM ekidd/rust-musl-builder:1.51.0 AS builder-image
+
+USER root
+
+# Install needed tools
+RUN apt-get update && \
+	apt-get install -y apt-transport-https curl && \
+	apt-get update && \
+	apt-get install -y python-minimal libtool autoconf automake && \
+	apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* && \
+	cargo install --version 0.1.20 cargo-chef
+
+# Install nvm
+RUN NVM_DIR="/root/.nvm" curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.38.0/install.sh | bash
+
+# ------------------------------------------------------------------------------
+# Rust plan stage
+# ------------------------------------------------------------------------------
+
+FROM builder-image AS planner
+
+WORKDIR /duniter
+
+# copy source tree
+COPY ./ ./
+
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ------------------------------------------------------------------------------
+# Rust cache stage
+# ------------------------------------------------------------------------------
+
+FROM builder-image AS cacher
+
+WORKDIR /duniter
+
+COPY --from=planner /duniter/recipe.json recipe.json
+
+RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
+
+# ------------------------------------------------------------------------------
+# Build stage
+# ------------------------------------------------------------------------------
+
+FROM builder-image AS builder
 
 LABEL maintainer="elois <elois@duniter.org>"
 LABEL version="0.1.0"
@@ -10,28 +54,33 @@ LABEL description="Duniter server (Crypto-currency software to manage libre curr
 
 ARG DUNITER_UI_VER="1.7.x"
 ARG INSTALL_DEX="no"
-
-RUN apk update && \
-	apk add ca-certificates curl && \
-	update-ca-certificates && \
-	apk add --update cmake g++ python make
+ARG NODE_VERSION="10.24.1"
 
 WORKDIR /duniter
 
 # copy source tree
 COPY ./ ./
 
-# install latest stable rust
-RUN curl https://sh.rustup.rs -sSf | sh -s -- -y
+# Copy over the rust cached dependencies
+COPY --from=cacher /duniter/target target
+COPY --from=cacher $CARGO_HOME $CARGO_HOME
+
+# Install nodejs 10.x
+RUN export NVM_DIR="$HOME/.nvm" && \
+	. "$NVM_DIR/nvm.sh"  && \
+	nvm install ${NODE_VERSION} && \
+	nvm use ${NODE_VERSION}
 
 # build duniter
-RUN PATH=${HOME}/.cargo/bin:${PATH} \
+RUN CARGO_BUILD_TARGET="x86_64-unknown-linux-musl" \
+	PATH=${HOME}/.cargo/bin:${HOME}/.nvm/versions/node/v${NODE_VERSION}/bin:${PATH} \
+	NVM_DIR="$HOME/.nvm" \
 	RUSTFLAGS="-C target-feature=-crt-static -L/usr/lib" \
-	make -C release ADD_DEBUG=N INSTALL_DEX=${INSTALL_DEX} server-gui clean \
+	make -C release ADD_DEBUG=N INSTALL_DEX=${INSTALL_DEX} TARGET_MUSL=yes server-gui clean \
 	&& rm -rf work/extra
 
 # ------------------------------------------------------------------------------
-# Final Stage
+# Final stage
 # ------------------------------------------------------------------------------
 
 FROM node:10-alpine
@@ -47,7 +96,7 @@ RUN addgroup -S -g 1111 duniter && \
 RUN mkdir -p /var/lib/duniter /etc/duniter && chown duniter:duniter /var/lib/duniter /etc/duniter
 
 # copy the build artifact from the build stage
-COPY --from=build --chown=duniter:duniter /duniter/work /duniter
+COPY --from=builder --chown=duniter:duniter /duniter/work /duniter
 
 # copy wrappers
 COPY release/docker/duniter.sh /usr/bin/duniter
